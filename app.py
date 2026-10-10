@@ -104,14 +104,27 @@ def analyze(symbol, period="1y"):
         errors = []
         for candidate in candidates:
             try:
-                trial = yf.download(candidate, period=period, interval="1d", auto_adjust=True,
-                                    progress=False, threads=False, timeout=20)
+                trial = yf.download(
+                    candidate,
+                    period=period,
+                    interval="1d",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=False,
+                    timeout=30,
+                    group_by="column",
+                    multi_level_index=False
+                )
+
                 if trial is not None and not trial.empty:
-                    df, actual_symbol = trial, candidate
+                    df = trial
+                    actual_symbol = candidate
                     break
-                errors.append(candidate)
-            except Exception:
-                errors.append(candidate)
+
+                errors.append(f"{candidate}: 空資料")
+
+            except Exception as e:
+                errors.append(f"{candidate}: {str(e)[:150]}")
         if df is None or df.empty:
             return None, f"查無可用日線行情：{symbol}。已嘗試：{', '.join(candidates)}。請確認代號、交易所後綴（.TW/.TWO），或稍後再試。"
         symbol = actual_symbol
