@@ -29,32 +29,72 @@ ALIASES = {
     "金像電":"2368.TW","2368":"2368.TW","健策":"3653.TW","3653":"3653.TW",
     "世芯-KY":"3661.TW","3661":"3661.TW","創意":"3443.TW","3443":"3443.TW",
     "力積電":"6770.TW","6770":"6770.TW","世界":"5347.TWO","5347":"5347.TWO",
+    "中美晶":"5483.TWO","5483":"5483.TWO","台半":"5425.TWO","5425":"5425.TWO",
+    "欣興":"3037.TW","3037":"3037.TW","南電":"8046.TW","8046":"8046.TW",
+    "景碩":"3189.TW","3189":"3189.TW","聯電":"2303.TW","2303":"2303.TW",
+    "日月光投控":"3711.TW","3711":"3711.TW","瑞昱":"2379.TW","2379":"2379.TW",
+    "聯詠":"3034.TW","3034":"3034.TW","大立光":"3008.TW","3008":"3008.TW",
+    "台泥":"1101.TW","1101":"1101.TW","亞泥":"1102.TW","1102":"1102.TW",
+    "統一":"1216.TW","1216":"1216.TW","遠東新":"1402.TW","1402":"1402.TW",
+    "中華電":"2412.TW","2412":"2412.TW","台灣大":"3045.TW","3045":"3045.TW",
+    "遠傳":"4904.TW","4904":"4904.TW","寶成":"9904.TW","9904":"9904.TW",
+    "大成鋼":"2027.TW","2027":"2027.TW","和碩":"4938.TW","4938":"4938.TW",
+    "宏碁":"2353.TW","2353":"2353.TW","華碩":"2357.TW","2357":"2357.TW",
+    "緯穎":"6669.TW","6669":"6669.TW","台燿":"6274.TW","6274":"6274.TW",
+    "材料-KY":"4763.TW","4763":"4763.TW","台塑":"1301.TW","1301":"1301.TW",
+    "南亞":"1303.TW","1303":"1303.TW","台化":"1326.TW","1326":"1326.TW",
     "原相":"3227.TWO","3227":"3227.TWO","創惟":"6104.TWO","6104":"6104.TWO",
     "群聯":"8299.TWO","8299":"8299.TWO","譜瑞-KY":"4966.TW","4966":"4966.TW",
 }
-def resolve_symbol(q):
+def symbol_candidates(q):
+    """Return plausible Yahoo Finance symbols; never assume every numeric code is TW."""
     q = str(q).strip()
-    if not q: return None
-    if q.upper().endswith((".TW", ".TWO")): return q.upper()
-    if q in ALIASES: return ALIASES[q]
+    if not q:
+        return []
+    if q.upper().endswith((".TW", ".TWO")):
+        return [q.upper()]
+    if q in ALIASES:
+        return [ALIASES[q]]
+    candidates = []
     if q.isdigit():
-        return q + (".TWO" if len(q)==4 and q.startswith(("3","5","6","8")) else ".TW")
-    # Best-effort Yahoo Finance search fallback
-    try:
-        sr = yf.Search(q, max_results=8)
-        quotes = getattr(sr, "quotes", []) or []
-        for item in quotes:
-            sym = item.get("symbol", "")
-            if sym.endswith((".TW", ".TWO")):
-                return sym
-    except Exception:
-        pass
-    return q
+        # Try both exchanges; Taiwan ticker exchange assignment varies.
+        candidates = [q + ".TW", q + ".TWO"]
+    else:
+        # Yahoo Finance search can return the exact Taiwanese ticker.
+        try:
+            sr = yf.Search(q, max_results=15)
+            quotes = getattr(sr, "quotes", []) or []
+            for item in quotes:
+                sym = str(item.get("symbol", "")).upper()
+                if sym.endswith((".TW", ".TWO")) and sym not in candidates:
+                    candidates.append(sym)
+        except Exception:
+            pass
+    return candidates
+
+def resolve_symbol(q):
+    candidates = symbol_candidates(q)
+    return candidates[0] if candidates else str(q).strip()
 
 def analyze(symbol, period="1y"):
     try:
-        df = yf.download(symbol, period=period, interval="1d", auto_adjust=True, progress=False, threads=False)
-        if df is None or df.empty: return None, f"查無行情：{symbol}"
+        candidates = symbol_candidates(symbol) or [symbol]
+        df = None
+        actual_symbol = symbol
+        errors = []
+        for candidate in candidates:
+            try:
+                trial = yf.download(candidate, period=period, interval="1d", auto_adjust=True,
+                                    progress=False, threads=False, timeout=20)
+                if trial is not None and not trial.empty:
+                    df, actual_symbol = trial, candidate
+                    break
+                errors.append(candidate)
+            except Exception:
+                errors.append(candidate)
+        if df is None or df.empty:
+            return None, f"查無可用日線行情：{symbol}。已嘗試：{', '.join(candidates)}。請確認代號、交易所後綴（.TW/.TWO），或稍後再試。"
+        symbol = actual_symbol
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         required = {"Close","High","Low","Volume"}
