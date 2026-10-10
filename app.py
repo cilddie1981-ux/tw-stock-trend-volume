@@ -68,7 +68,38 @@ def resolve_symbol(user_input):
     digits = "".join(ch for ch in key if ch.isdigit())
     if len(digits) == 4 and digits == key:
         return digits + ".TW"
+    # 允許直接輸入公司名稱；依上市櫃公開清單比對。
+    try:
+        market_df, _ = load_market_list()
+        if not market_df.empty:
+            matched = market_df[market_df["名稱"].astype(str).str.strip() == raw.strip()]
+            if not matched.empty:
+                return str(matched.iloc[0]["代號"])
+    except Exception:
+        pass
     return raw
+
+
+def lookup_stock_name(symbol):
+    """優先從公開上市櫃清單取得公司名稱，查不到則使用內建別名。"""
+    normalized = resolve_symbol(symbol)
+    try:
+        market_df, _ = load_market_list()
+        if not market_df.empty:
+            matched = market_df[market_df["代號"].astype(str).str.upper() == normalized.upper()]
+            if not matched.empty:
+                return str(matched.iloc[0]["名稱"])
+            code = normalized.split(".")[0]
+            matched = market_df[market_df["股票代號"].astype(str) == code]
+            if not matched.empty:
+                return str(matched.iloc[0]["名稱"])
+    except Exception:
+        pass
+    reverse_aliases = {
+        "2330.TW": "台積電", "1609.TW": "大亞", "2340.TW": "台亞",
+        "6117.TW": "迎廣", "1802.TW": "台玻", "3550.TW": "聯穎",
+    }
+    return reverse_aliases.get(normalized.upper(), "名稱資料暫缺")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -393,6 +424,7 @@ def analyze(symbol, period="1y"):
 
     result = {
         "代號": used_symbol,
+        "名稱": lookup_stock_name(used_symbol),
         "現價": price,
         "資料日期": pd.Timestamp(df.index[-1]).strftime("%Y-%m-%d"),
         "資料筆數": len(df),
@@ -525,7 +557,7 @@ def show_analysis(result):
         st.error((result or {}).get("error", "分析失敗"))
         return
 
-    st.subheader(f"分析結果：{result['代號']}")
+    st.subheader(f"分析結果：{result['代號']}｜{result['名稱']}")
     st.caption(f"行情資料日期：{result['資料日期']}｜共 {result['資料筆數']} 筆日線資料。行情來源為 Yahoo Finance，非保證即時。")
 
     c1, c2, c3, c4 = st.columns(4)
@@ -656,8 +688,6 @@ with st.sidebar:
             "個股分析",
             "上市櫃全市場掃描",
             "技術強勢股排行榜",
-            "基本面合理價掃描",
-            "技術＋基本面交集",
             "自選股清單",
         ],
     )
@@ -681,8 +711,19 @@ if page == "個股分析":
             result = analyze(query, period_map[period_label])
         show_analysis(result)
         if not result.get("error"):
-            with st.expander("查看財務資料與合理價參考"):
-                render_fundamental(result["代號"])
+            st.markdown("### 💰 合理價參考")
+            fund = render_fundamental(result["代號"])
+            fair_low = as_float(fund.get("估值參考低檔")) if isinstance(fund, dict) else np.nan
+            fair_mid = as_float(fund.get("估值參考中位")) if isinstance(fund, dict) else np.nan
+            fair_high = as_float(fund.get("估值參考高檔")) if isinstance(fund, dict) else np.nan
+            if np.isfinite(fair_low) and np.isfinite(fair_mid) and np.isfinite(fair_high):
+                st.info(
+                    f"合理價參考區間：{fmt_price(fair_low)}～{fmt_price(fair_high)}；"
+                    f"中位參考 {fmt_price(fair_mid)}。此估值依可取得的 EPS／本益比作敏感度推估，"
+                    "不是保證價格，也不是獨立研究報告。"
+                )
+            else:
+                st.warning("目前財務資料不足，無法可靠估算合理價；不以 0 元或任意數值代替。")
 
 # ------------------------------
 # 2. 上市櫃全市場掃描
@@ -721,82 +762,6 @@ elif page == "技術強勢股排行榜":
                 ranked = ranked.sort_values(["技術分數", "20日乖離率(%)"], ascending=[False, True])
                 st.dataframe(ranked, use_container_width=True, hide_index=True)
                 dataframe_csv_download(ranked, "tw_stock_technical_rank.csv")
-
-# ------------------------------
-# 4. 基本面合理價掃描
-# ------------------------------
-elif page == "基本面合理價掃描":
-    st.subheader("💰 基本面估值參考掃描")
-    st.caption("以 Yahoo Finance 可取得的 EPS／本益比作敏感度推估。財務欄位可能缺漏，並非獨立合理價評估。")
-    market_df, market_error = load_market_list()
-    if market_error:
-        st.caption(market_error)
-    if not market_df.empty:
-        limit = st.number_input("掃描檔數", min_value=1, max_value=1000, value=30, step=10, key="fair_limit")
-        if st.button("掃描估值參考", type="primary"):
-            rows = []
-            progress = st.progress(0)
-            status = st.empty()
-            subset = market_df.head(int(limit))
-            for idx, row in enumerate(subset.itertuples(index=False), start=1):
-                try:
-                    fund = fetch_fundamentals(row.代號)
-                    fund["名稱"] = row.名稱
-                    fund["市場"] = row.市場
-                    if "估值參考中位" in fund and np.isfinite(as_float(fund.get("估值參考中位"))):
-                        fund["相對財務現價空間(%)"] = (
-                            (fund["估值參考中位"] / fund["現價(財務來源)"] - 1) * 100
-                            if np.isfinite(as_float(fund.get("現價(財務來源)"))) and fund["現價(財務來源)"] > 0
-                            else np.nan
-                        )
-                    rows.append(fund)
-                except Exception:
-                    pass
-                progress.progress(idx / len(subset))
-                status.text(f"估值掃描：{idx}/{len(subset)}")
-                time.sleep(0.05)
-            progress.empty()
-            status.empty()
-            out = pd.DataFrame(rows)
-            if not out.empty:
-                if "相對財務現價空間(%)" in out.columns:
-                    out = out.sort_values("相對財務現價空間(%)", ascending=False, na_position="last")
-                st.dataframe(out, use_container_width=True, hide_index=True)
-                dataframe_csv_download(out, "tw_stock_fundamental_scan.csv")
-
-# ------------------------------
-# 5. 技術＋基本面交集
-# ------------------------------
-elif page == "技術＋基本面交集":
-    st.subheader("🧩 技術＋基本面交集掃描")
-    st.caption("先以有限檔數掃描技術，再對技術分數較高的股票查詢估值資料；速度與成功率受公開資料服務影響。")
-    market_df, market_error = load_market_list()
-    if market_error:
-        st.caption(market_error)
-    if not market_df.empty:
-        limit = st.number_input("技術掃描檔數", min_value=1, max_value=1000, value=50, step=10, key="cross_limit")
-        shortlist_size = st.number_input("進一步查基本面檔數", min_value=1, max_value=100, value=15, step=5, key="cross_shortlist")
-        if st.button("掃描技術＋基本面交集", type="primary"):
-            with st.spinner("先掃描技術指標…"):
-                tech = scan_market(market_df, int(limit), "技術＋基本面交集")
-            if not tech.empty:
-                shortlist = tech.sort_values("技術分數", ascending=False).head(int(shortlist_size))
-                rows = []
-                progress = st.progress(0)
-                for idx, item in enumerate(shortlist.to_dict("records"), start=1):
-                    fund = fetch_fundamentals(item["代號"])
-                    merged = dict(item)
-                    merged.update({f"基本面_{k}": v for k, v in fund.items() if k != "代號"})
-                    fair = as_float(fund.get("估值參考中位"))
-                    px = as_float(item.get("現價"))
-                    merged["估值中位相對現價(%)"] = (fair / px - 1) * 100 if np.isfinite(fair) and np.isfinite(px) and px > 0 else np.nan
-                    rows.append(merged)
-                    progress.progress(idx / len(shortlist))
-                    time.sleep(0.05)
-                progress.empty()
-                out = pd.DataFrame(rows)
-                st.dataframe(out, use_container_width=True, hide_index=True)
-                dataframe_csv_download(out, "tw_stock_technical_fundamental_cross.csv")
 
 # ------------------------------
 # 6. 自選股清單
