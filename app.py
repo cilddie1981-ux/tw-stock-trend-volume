@@ -47,10 +47,24 @@ ALIASES = {
     "群聯":"8299.TWO","8299":"8299.TWO","譜瑞-KY":"4966.TW","4966":"4966.TW",
 }
 def symbol_candidates(q):
-    """搜尋台股代號，支援中文名稱及上市、上櫃代號。"""
-    q = str(q).strip()
-    if not q:
-        return []
+    """Generate Taiwan stock ticker candidates."""
+    q = str(q).strip().upper()
+
+    aliases = {
+        "雙鴻": "3324",
+    }
+
+    if q in aliases:
+        q = aliases[q]
+
+    if q.endswith((".TW", ".TWO")):
+        code = q.rsplit(".", 1)[0]
+        return [code + ".TW", code + ".TWO"]
+
+    if q.isdigit():
+        return [q + ".TW", q + ".TWO"]
+
+    return []
 
     # 已輸入完整代號
     if q.upper().endswith(".TW"):
