@@ -51,52 +51,70 @@ def symbol_candidates(q):
     q = str(q).strip().upper()
 
     aliases = {
+        "台積電": "2330",
+        "鴻海": "2317",
+        "聯發科": "2454",
+        "台達電": "2308",
+        "廣達": "2382",
+        "緯創": "3231",
+        "技嘉": "2376",
+        "微星": "2377",
+        "奇鋐": "3017",
+        "台光電": "2383",
+        "金像電": "2368",
+        "健策": "3653",
+        "大亞": "1609",
+        "台亞": "2340",
+        "迎廣": "6117",
+        "台玻": "1802",
+        "華邦電": "2344",
+        "南亞科": "2408",
+        "群創": "3481",
+        "友達": "2409",
+        "長榮": "2603",
+        "陽明": "2609",
+        "萬海": "2615",
+        "中鋼": "2002",
+        "國泰金": "2882",
+        "富邦金": "2881",
+        "中信金": "2891",
+        "華航": "2610",
+        "長榮航": "2618",
+        "世界": "5347",
+        "原相": "3227",
+        "創惟": "6104",
+        "群聯": "8299",
+        "力積電": "6770",
         "雙鴻": "3324",
     }
 
     if q in aliases:
         q = aliases[q]
 
-    if q.endswith((".TW", ".TWO")):
-        code = q.rsplit(".", 1)[0]
+    if q.endswith(".TW"):
+        code = q[:-3]
         return [code + ".TW", code + ".TWO"]
 
+    if q.endswith(".TWO"):
+        code = q[:-4]
+        return [code + ".TWO", code + ".TW"]
+
     if q.isdigit():
         return [q + ".TW", q + ".TWO"]
 
-    return []
-
-    # 已輸入完整代號
-    if q.upper().endswith(".TW"):
-        return [q.upper()]
-
-    if q.upper().endswith(".TWO"):
-        return [q.upper()]
-
-    # 優先使用內建中文名稱對照
-    if q in ALIASES:
-        return [ALIASES[q]]
-
+    # Try Yahoo Finance search for other company names.
     candidates = []
 
-    # 純數字代號：同時嘗試上市、上櫃
-    if q.isdigit():
-        return [q + ".TW", q + ".TWO"]
-
-    # Yahoo Finance 中文名稱搜尋
     try:
         result = yf.Search(q, max_results=20)
         quotes = getattr(result, "quotes", []) or []
 
         for item in quotes:
-            symbol = str(item.get("symbol", "")).upper()
+            ticker = str(item.get("symbol", "")).upper()
 
-            if (
-                symbol.endswith(".TW")
-                or symbol.endswith(".TWO")
-            ):
-                if symbol not in candidates:
-                    candidates.append(symbol)
+            if ticker.endswith((".TW", ".TWO")):
+                if ticker not in candidates:
+                    candidates.append(ticker)
 
     except Exception:
         pass
@@ -107,10 +125,6 @@ def symbol_candidates(q):
 def resolve_symbol(q):
     candidates = symbol_candidates(q)
     return candidates[0] if candidates else str(q).strip()
-    candidates = symbol_candidates(q)
-    return candidates[0] if candidates else str(q).strip()
-
-def analyze(symbol, period="1y"):
     try:
         candidates = symbol_candidates(symbol) or [symbol]
         df = None
