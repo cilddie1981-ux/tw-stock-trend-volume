@@ -47,32 +47,52 @@ ALIASES = {
     "群聯":"8299.TWO","8299":"8299.TWO","譜瑞-KY":"4966.TW","4966":"4966.TW",
 }
 def symbol_candidates(q):
-    """Return plausible Yahoo Finance symbols; never assume every numeric code is TW."""
+    """搜尋台股代號，支援中文名稱及上市、上櫃代號。"""
     q = str(q).strip()
     if not q:
         return []
-    if q.upper().endswith((".TW", ".TWO")):
+
+    # 已輸入完整代號
+    if q.upper().endswith(".TW"):
         return [q.upper()]
+
+    if q.upper().endswith(".TWO"):
+        return [q.upper()]
+
+    # 優先使用內建中文名稱對照
     if q in ALIASES:
         return [ALIASES[q]]
+
     candidates = []
+
+    # 純數字代號：同時嘗試上市、上櫃
     if q.isdigit():
-        # Try both exchanges; Taiwan ticker exchange assignment varies.
-        candidates = [q + ".TW", q + ".TWO"]
-    else:
-        # Yahoo Finance search can return the exact Taiwanese ticker.
-        try:
-            sr = yf.Search(q, max_results=15)
-            quotes = getattr(sr, "quotes", []) or []
-            for item in quotes:
-                sym = str(item.get("symbol", "")).upper()
-                if sym.endswith((".TW", ".TWO")) and sym not in candidates:
-                    candidates.append(sym)
-        except Exception:
-            pass
+        return [q + ".TW", q + ".TWO"]
+
+    # Yahoo Finance 中文名稱搜尋
+    try:
+        result = yf.Search(q, max_results=20)
+        quotes = getattr(result, "quotes", []) or []
+
+        for item in quotes:
+            symbol = str(item.get("symbol", "")).upper()
+
+            if (
+                symbol.endswith(".TW")
+                or symbol.endswith(".TWO")
+            ):
+                if symbol not in candidates:
+                    candidates.append(symbol)
+
+    except Exception:
+        pass
+
     return candidates
 
+
 def resolve_symbol(q):
+    candidates = symbol_candidates(q)
+    return candidates[0] if candidates else str(q).strip()
     candidates = symbol_candidates(q)
     return candidates[0] if candidates else str(q).strip()
 
