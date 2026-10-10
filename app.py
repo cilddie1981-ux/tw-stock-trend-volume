@@ -1,4 +1,5 @@
 import io
+import html
 import time
 from datetime import datetime, timezone
 
@@ -13,6 +14,51 @@ st.set_page_config(
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+# ------------------------------
+# 全域樣式：置頂股票橫幅
+# ------------------------------
+st.markdown(
+    """
+    <style>
+    .sticky-stock-banner {
+        position: -webkit-sticky;
+        position: sticky;
+        top: 0.5rem;
+        z-index: 9999;
+        background: #ffffff;
+        color: #111111;
+        border: 1px solid rgba(0, 0, 0, 0.12);
+        border-radius: 10px;
+        padding: 10px 16px;
+        margin: 6px 0 14px 0;
+        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.10);
+    }
+    .sticky-stock-banner .banner-label {
+        font-size: 12px;
+        color: #666666;
+        letter-spacing: 0.05em;
+    }
+    .sticky-stock-banner .banner-title {
+        font-size: 22px;
+        font-weight: 800;
+        line-height: 1.35;
+        color: #111111;
+    }
+    .sticky-stock-banner .banner-date {
+        font-size: 12px;
+        color: #777777;
+        margin-top: 2px;
+    }
+    @media (max-width: 768px) {
+        .sticky-stock-banner { padding: 8px 12px; top: 0.25rem; }
+        .sticky-stock-banner .banner-title { font-size: 18px; }
+        .sticky-stock-banner .banner-date { font-size: 11px; }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 st.title("📈 台股趨勢指標 3.0")
@@ -100,6 +146,23 @@ def lookup_stock_name(symbol):
         "6117.TW": "迎廣", "1802.TW": "台玻", "3550.TW": "聯穎",
     }
     return reverse_aliases.get(normalized.upper(), "名稱資料暫缺")
+
+
+def render_sticky_banner(container, code, name, quote_date=None):
+    """統一的置頂股票橫幅；每次 rerun 都呼叫，確保代號＋名稱持續可見。"""
+    code_text = html.escape(str(code) if code else "—")
+    name_text = html.escape(str(name) if name else "請輸入股票")
+    date_text = html.escape(str(quote_date) if quote_date else "尚未取得行情日期")
+    container.markdown(
+        f"""
+        <div class="sticky-stock-banner">
+            <div class="banner-label">目前分析標的</div>
+            <div class="banner-title">{code_text}｜{name_text}</div>
+            <div class="banner-date">行情日期：{date_text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -700,6 +763,10 @@ with st.sidebar:
 # ------------------------------
 if page == "個股分析":
     st.subheader("🔎 個股趨勢＋量價分析")
+
+    # 置頂橫幅容器：每次 rerun 都重畫，確保代號＋名稱持續可見。
+    banner_slot = st.empty()
+
     col1, col2 = st.columns([2, 1])
     with col1:
         query = st.text_input("輸入台股代號或名稱", value="2330", placeholder="例如：2330、台積電、1609、大亞")
@@ -707,24 +774,34 @@ if page == "個股分析":
         period_label = st.selectbox("歷史資料範圍", ["6 個月", "1 年", "2 年", "5 年"], index=1)
     period_map = {"6 個月": "6mo", "1 年": "1y", "2 年": "2y", "5 年": "5y"}
 
-    # 固定顯示目前選取的股票，往下捲動頁面時仍能看見代號＋名稱。
-    selected_symbol = resolve_symbol(query)
-    selected_name = lookup_stock_name(selected_symbol) if selected_symbol else "請輸入股票"
-    display_code = selected_symbol.split(".")[0] if selected_symbol else "—"
-    sticky_stock_banner = (
-        '<div style="position:sticky;top:0;z-index:9999;background:var(--background-color,#ffffff);'
-        'border:1px solid rgba(128,128,128,.35);border-radius:10px;padding:10px 14px;margin:8px 0 14px 0;'
-        'box-shadow:0 2px 8px rgba(0,0,0,.08);">'
-        '<div style="font-size:12px;opacity:.75;">目前分析標的</div>'
-        f'<div style="font-size:22px;font-weight:750;line-height:1.4;">{display_code}｜{selected_name}</div>'
-        '</div>'
-    )
-    st.markdown(sticky_stock_banner, unsafe_allow_html=True)
+    # 先依目前輸入即時更新一次，讓使用者一輸入就看見代號＋名稱。
+    preview_symbol = resolve_symbol(query) if query else ""
+    preview_name = lookup_stock_name(preview_symbol) if preview_symbol else "請輸入股票"
+    preview_code = preview_symbol.split(".")[0] if preview_symbol else "—"
+    render_sticky_banner(banner_slot, preview_code, preview_name)
 
     if st.button("開始分析", type="primary", use_container_width=True):
         with st.spinner("下載行情並計算技術指標…"):
             result = analyze(query, period_map[period_label])
+
+        if not result.get("error"):
+            used_symbol = result.get("代號") or preview_symbol
+            used_name = result.get("名稱") or preview_name
+            used_date = result.get("資料日期")
+            used_code = used_symbol.split(".")[0] if used_symbol else "—"
+
+            # 用實際使用的代號與資料日期更新置頂橫幅。
+            render_sticky_banner(banner_slot, used_code, used_name, used_date)
+
+            st.session_state["last_symbol"] = used_symbol
+            st.session_state["last_name"] = used_name
+            st.session_state["last_quote_date"] = used_date
+        else:
+            # 分析失敗仍保留代號＋名稱，日期明確顯示尚未取得。
+            render_sticky_banner(banner_slot, preview_code, preview_name, None)
+
         show_analysis(result)
+
         if not result.get("error"):
             st.markdown("### 💰 合理價參考")
             fund = render_fundamental(result["代號"])
@@ -779,7 +856,7 @@ elif page == "技術強勢股排行榜":
                 dataframe_csv_download(ranked, "tw_stock_technical_rank.csv")
 
 # ------------------------------
-# 6. 自選股清單
+# 4. 自選股清單
 # ------------------------------
 elif page == "自選股清單":
     st.subheader("⭐ 自選股清單")
