@@ -706,6 +706,21 @@ if page == "個股分析":
     with col2:
         period_label = st.selectbox("歷史資料範圍", ["6 個月", "1 年", "2 年", "5 年"], index=1)
     period_map = {"6 個月": "6mo", "1 年": "1y", "2 年": "2y", "5 年": "5y"}
+
+    # 固定顯示目前選取的股票，往下捲動頁面時仍能看見代號＋名稱。
+    selected_symbol = resolve_symbol(query)
+    selected_name = lookup_stock_name(selected_symbol) if selected_symbol else "請輸入股票"
+    display_code = selected_symbol.split(".")[0] if selected_symbol else "—"
+    sticky_stock_banner = (
+        '<div style="position:sticky;top:0;z-index:9999;background:var(--background-color,#ffffff);'
+        'border:1px solid rgba(128,128,128,.35);border-radius:10px;padding:10px 14px;margin:8px 0 14px 0;'
+        'box-shadow:0 2px 8px rgba(0,0,0,.08);">'
+        '<div style="font-size:12px;opacity:.75;">目前分析標的</div>'
+        f'<div style="font-size:22px;font-weight:750;line-height:1.4;">{display_code}｜{selected_name}</div>'
+        '</div>'
+    )
+    st.markdown(sticky_stock_banner, unsafe_allow_html=True)
+
     if st.button("開始分析", type="primary", use_container_width=True):
         with st.spinner("下載行情並計算技術指標…"):
             result = analyze(query, period_map[period_label])
