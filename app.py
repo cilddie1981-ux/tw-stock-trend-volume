@@ -1,5 +1,4 @@
 import io
-import html
 import time
 from datetime import datetime, timezone
 
@@ -14,51 +13,6 @@ st.set_page_config(
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
-)
-
-# ------------------------------
-# 全域樣式：置頂股票橫幅
-# ------------------------------
-st.markdown(
-    """
-    <style>
-    .sticky-stock-banner {
-        position: -webkit-sticky;
-        position: sticky;
-        top: 0.5rem;
-        z-index: 9999;
-        background: #ffffff;
-        color: #111111;
-        border: 1px solid rgba(0, 0, 0, 0.12);
-        border-radius: 10px;
-        padding: 10px 16px;
-        margin: 6px 0 14px 0;
-        box-shadow: 0 4px 14px rgba(0, 0, 0, 0.10);
-    }
-    .sticky-stock-banner .banner-label {
-        font-size: 12px;
-        color: #666666;
-        letter-spacing: 0.05em;
-    }
-    .sticky-stock-banner .banner-title {
-        font-size: 22px;
-        font-weight: 800;
-        line-height: 1.35;
-        color: #111111;
-    }
-    .sticky-stock-banner .banner-date {
-        font-size: 12px;
-        color: #777777;
-        margin-top: 2px;
-    }
-    @media (max-width: 768px) {
-        .sticky-stock-banner { padding: 8px 12px; top: 0.25rem; }
-        .sticky-stock-banner .banner-title { font-size: 18px; }
-        .sticky-stock-banner .banner-date { font-size: 11px; }
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
 )
 
 st.title("📈 台股趨勢指標 3.0")
@@ -146,23 +100,6 @@ def lookup_stock_name(symbol):
         "6117.TW": "迎廣", "1802.TW": "台玻", "3550.TW": "聯穎",
     }
     return reverse_aliases.get(normalized.upper(), "名稱資料暫缺")
-
-
-def render_sticky_banner(container, code, name, quote_date=None):
-    """統一的置頂股票橫幅；每次 rerun 都呼叫，確保代號＋名稱持續可見。"""
-    code_text = html.escape(str(code) if code else "—")
-    name_text = html.escape(str(name) if name else "請輸入股票")
-    date_text = html.escape(str(quote_date) if quote_date else "尚未取得行情日期")
-    container.markdown(
-        f"""
-        <div class="sticky-stock-banner">
-            <div class="banner-label">目前分析標的</div>
-            <div class="banner-title">{code_text}｜{name_text}</div>
-            <div class="banner-date">行情日期：{date_text}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -303,6 +240,57 @@ def calculate_indicators(df):
     return df
 
 
+
+def estimate_direction_probability(df, horizon=5):
+    """以歷史相似技術條件的未來報酬，估算方向頻率；不是經校準的預測模型。"""
+    data = df.copy()
+    close = data["Close"].astype(float)
+    score = pd.Series(0, index=data.index, dtype=float)
+
+    # 以可解釋的技術條件建立每日分數，避免使用未來資料作為當日特徵。
+    score += (close > data["MA20"]).astype(int)
+    score += (data["MA20"] > data["MA60"]).astype(int)
+    score += (data["MACD_HIST"] > 0).astype(int)
+    score += ((data["RSI"] >= 50) & (data["RSI"] < 75)).astype(int)
+    score += (data["K"] > data["D"]).astype(int)
+    score += (data["VOL_MA5"] >= data["VOL_MA10"]).astype(int)
+    score -= (close < data["MA20"]).astype(int)
+    score -= (data["MA20"] < data["MA60"]).astype(int)
+    score -= (data["MACD_HIST"] < 0).astype(int)
+    score -= (data["RSI"] < 45).astype(int)
+    score -= (data["K"] < data["D"]).astype(int)
+    score -= (data["VOL_MA5"] < data["VOL_MA10"] * 0.8).astype(int)
+
+    # 歷史樣本必須已經走完未來 horizon 個交易日，避免把尚未發生的報酬算入樣本。
+    future_return = close.shift(-horizon) / close - 1
+    current_score = as_float(score.iloc[-1], 0)
+    historical = pd.DataFrame({"score": score, "future_return": future_return}).iloc[:-horizon].dropna()
+    similar = historical[historical["score"].sub(current_score).abs() <= 1]
+    sample_count = len(similar)
+
+    if sample_count >= 20:
+        up = float((similar["future_return"] > 0).mean() * 100)
+        down = float((similar["future_return"] < 0).mean() * 100)
+        flat = max(0.0, 100.0 - up - down)
+        method = "歷史相似技術分數樣本頻率"
+    else:
+        # 樣本不足時只提供明確標示的指標分數傾向，不假裝是歷史統計機率。
+        clipped = float(np.clip(current_score, -6, 6))
+        up = float(np.clip(50 + clipped * 4, 26, 74))
+        down = 100.0 - up
+        flat = 0.0
+        method = "樣本不足：技術分數換算的方向傾向，非統計機率"
+
+    return {
+        "預測週期": f"未來 {horizon} 個交易日",
+        "上漲機率(%)": round(up, 1),
+        "下跌機率(%)": round(down, 1),
+        "盤整機率(%)": round(flat, 1),
+        "相似歷史樣本數": sample_count,
+        "方向估計方法": method,
+        "技術分數": int(current_score),
+    }
+
 def _round_price(value):
     value = as_float(value)
     if not np.isfinite(value):
@@ -336,6 +324,7 @@ def analyze(symbol, period="1y"):
         return {"error": f"{used_symbol} 僅取得 {len(raw)} 筆日線資料，少於 60 筆，無法完整判斷中長期均線。"}
 
     df = calculate_indicators(raw)
+    probability = estimate_direction_probability(df, horizon=5)
     last = df.iloc[-1]
     prev = df.iloc[-2]
     price = as_float(last["Close"])
@@ -518,6 +507,7 @@ def analyze(symbol, period="1y"):
         "突破風險報酬比": round(rr_breakout, 2) if np.isfinite(rr_breakout) else np.nan,
         "價格計算檢查": "；".join(checks),
         "目前訊號": signal,
+        **probability,
         "_df": df,
     }
     return result
@@ -628,6 +618,17 @@ def show_analysis(result):
     c2.metric("趨勢", result["趨勢"])
     c3.metric("位置", result["位置"])
     c4.metric("目前訊號", result["目前訊號"])
+
+    st.markdown("### 🔮 未來 5 個交易日方向估計")
+    p1, p2, p3 = st.columns(3)
+    p1.metric("上漲機率／傾向", f"{result['上漲機率(%)']:.1f}%")
+    p2.metric("下跌機率／傾向", f"{result['下跌機率(%)']:.1f}%")
+    p3.metric("盤整機率", f"{result['盤整機率(%)']:.1f}%")
+    st.caption(
+        f"估計方式：{result['方向估計方法']}；相似歷史樣本數：{result['相似歷史樣本數']}；"
+        f"技術分數：{result['技術分數']}。此結果是歷史方向頻率或指標傾向，不是經校準的預測模型，"
+        "不代表實際未來必然如此，也未納入突發消息、財報、政策及大盤變化。"
+    )
 
     main_rows = [
         ("KD", f"{result['KD']}（K {result['K值']:.1f}／D {result['D值']:.1f}）"),
@@ -763,10 +764,6 @@ with st.sidebar:
 # ------------------------------
 if page == "個股分析":
     st.subheader("🔎 個股趨勢＋量價分析")
-
-    # 置頂橫幅容器：每次 rerun 都重畫，確保代號＋名稱持續可見。
-    banner_slot = st.empty()
-
     col1, col2 = st.columns([2, 1])
     with col1:
         query = st.text_input("輸入台股代號或名稱", value="2330", placeholder="例如：2330、台積電、1609、大亞")
@@ -774,34 +771,24 @@ if page == "個股分析":
         period_label = st.selectbox("歷史資料範圍", ["6 個月", "1 年", "2 年", "5 年"], index=1)
     period_map = {"6 個月": "6mo", "1 年": "1y", "2 年": "2y", "5 年": "5y"}
 
-    # 先依目前輸入即時更新一次，讓使用者一輸入就看見代號＋名稱。
-    preview_symbol = resolve_symbol(query) if query else ""
-    preview_name = lookup_stock_name(preview_symbol) if preview_symbol else "請輸入股票"
-    preview_code = preview_symbol.split(".")[0] if preview_symbol else "—"
-    render_sticky_banner(banner_slot, preview_code, preview_name)
+    # 固定顯示目前選取的股票，往下捲動頁面時仍能看見代號＋名稱。
+    selected_symbol = resolve_symbol(query)
+    selected_name = lookup_stock_name(selected_symbol) if selected_symbol else "請輸入股票"
+    display_code = selected_symbol.split(".")[0] if selected_symbol else "—"
+    sticky_stock_banner = (
+        '<div style="position:sticky;top:0;z-index:9999;background:var(--background-color,#ffffff);'
+        'border:1px solid rgba(128,128,128,.35);border-radius:10px;padding:10px 14px;margin:8px 0 14px 0;'
+        'box-shadow:0 2px 8px rgba(0,0,0,.08);">'
+        '<div style="font-size:12px;opacity:.75;">目前分析標的</div>'
+        f'<div style="font-size:22px;font-weight:750;line-height:1.4;">{display_code}｜{selected_name}</div>'
+        '</div>'
+    )
+    st.markdown(sticky_stock_banner, unsafe_allow_html=True)
 
     if st.button("開始分析", type="primary", use_container_width=True):
         with st.spinner("下載行情並計算技術指標…"):
             result = analyze(query, period_map[period_label])
-
-        if not result.get("error"):
-            used_symbol = result.get("代號") or preview_symbol
-            used_name = result.get("名稱") or preview_name
-            used_date = result.get("資料日期")
-            used_code = used_symbol.split(".")[0] if used_symbol else "—"
-
-            # 用實際使用的代號與資料日期更新置頂橫幅。
-            render_sticky_banner(banner_slot, used_code, used_name, used_date)
-
-            st.session_state["last_symbol"] = used_symbol
-            st.session_state["last_name"] = used_name
-            st.session_state["last_quote_date"] = used_date
-        else:
-            # 分析失敗仍保留代號＋名稱，日期明確顯示尚未取得。
-            render_sticky_banner(banner_slot, preview_code, preview_name, None)
-
         show_analysis(result)
-
         if not result.get("error"):
             st.markdown("### 💰 合理價參考")
             fund = render_fundamental(result["代號"])
@@ -856,7 +843,7 @@ elif page == "技術強勢股排行榜":
                 dataframe_csv_download(ranked, "tw_stock_technical_rank.csv")
 
 # ------------------------------
-# 4. 自選股清單
+# 6. 自選股清單
 # ------------------------------
 elif page == "自選股清單":
     st.subheader("⭐ 自選股清單")
