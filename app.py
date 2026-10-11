@@ -584,7 +584,7 @@ def analyze(symbol, period="1y"):
 
 
 def fetch_fundamentals(symbol):
-    """依股感文章的十種方法整理估值；資料不足的方法明確標示，不強行給價。"""
+    """取得計算本益比、股價淨值比、殖利率估值所需的基本財務資料。"""
     symbol = resolve_symbol(symbol)
     try:
         ticker = yf.Ticker(symbol)
@@ -606,78 +606,14 @@ def fetch_fundamentals(symbol):
     pe_fwd = first_number(info, "forwardPE")
     book = first_number(info, "bookValue")
     pb = first_number(info, "priceToBook")
-    ps = first_number(info, "priceToSalesTrailing12Months")
-    peg = first_number(info, "trailingPegRatio", "pegRatio")
-    ev_ebitda = first_number(info, "enterpriseToEbitda")
-    ev_sales = first_number(info, "enterpriseToRevenue")
-    shares = first_number(info, "sharesOutstanding", "impliedSharesOutstanding")
-    total_revenue = first_number(info, "totalRevenue")
-    total_debt = first_number(info, "totalDebt")
-    cash = first_number(info, "totalCash")
-    ebitda = first_number(info, "ebitda")
     dividend_rate = first_number(info, "dividendRate", "trailingAnnualDividendRate")
     div_yield = first_number(info, "dividendYield")
-    growth = first_number(info, "earningsGrowth", "revenueGrowth")
-    fcf = first_number(info, "freeCashflow")
-    currency = info.get("currency", "TWD")
+    # 若 API 未提供年度股利，但有殖利率與現價，反推年度股利；僅作資料備援。
+    if (not np.isfinite(dividend_rate) or dividend_rate <= 0) and np.isfinite(price) and price > 0 and np.isfinite(div_yield) and div_yield > 0:
+        dividend_rate = price * div_yield
+    if (not np.isfinite(div_yield) or div_yield <= 0) and np.isfinite(price) and price > 0 and np.isfinite(dividend_rate) and dividend_rate > 0:
+        div_yield = dividend_rate / price
 
-    # 估值是情境試算：優先用可取得的市場倍數，不將市場現值倍數包裝成獨立目標價。
-    pe_multiple = pe_fwd if np.isfinite(pe_fwd) and 0 < pe_fwd < 100 else (pe_ttm if np.isfinite(pe_ttm) and 0 < pe_ttm < 100 else np.nan)
-    eps = eps_fwd if np.isfinite(eps_fwd) and eps_fwd > 0 else eps_ttm
-    pe_value = eps * pe_multiple if np.isfinite(eps) and eps > 0 and np.isfinite(pe_multiple) else np.nan
-    pb_value = book * pb if np.isfinite(book) and book > 0 and np.isfinite(pb) and 0 < pb < 30 else np.nan
-    revenue_per_share = total_revenue / shares if np.isfinite(total_revenue) and total_revenue > 0 and np.isfinite(shares) and shares > 0 else np.nan
-    ps_value = revenue_per_share * ps if np.isfinite(revenue_per_share) and np.isfinite(ps) and 0 < ps < 50 else np.nan
-    # EV 倍數推估股權價值：(EBITDA × EV/EBITDA - 淨負債) / 股數。
-    ev_ebitda_value = np.nan
-    if np.isfinite(ebitda) and ebitda > 0 and np.isfinite(ev_ebitda) and 0 < ev_ebitda < 100 and np.isfinite(shares) and shares > 0:
-        net_debt = (total_debt if np.isfinite(total_debt) else 0) - (cash if np.isfinite(cash) else 0)
-        ev_ebitda_value = (ebitda * ev_ebitda - net_debt) / shares
-        if ev_ebitda_value <= 0:
-            ev_ebitda_value = np.nan
-    ev_sales_value = np.nan
-    if np.isfinite(total_revenue) and total_revenue > 0 and np.isfinite(ev_sales) and 0 < ev_sales < 50 and np.isfinite(shares) and shares > 0:
-        net_debt = (total_debt if np.isfinite(total_debt) else 0) - (cash if np.isfinite(cash) else 0)
-        ev_sales_value = (total_revenue * ev_sales - net_debt) / shares
-        if ev_sales_value <= 0:
-            ev_sales_value = np.nan
-
-    # DDM/Gordon 成長模型：採可調整的示範假設，不把假設值當成客觀預測。
-    ddm_value = np.nan
-    if np.isfinite(dividend_rate) and dividend_rate > 0:
-        discount_rate, dividend_growth = 0.10, 0.02
-        if discount_rate > dividend_growth:
-            ddm_value = dividend_rate * (1 + dividend_growth) / (discount_rate - dividend_growth)
-
-    # 簡化 FCFF 永續成長 DCF：只在 Yahoo 有可用自由現金流、股數與淨負債時試算。
-    dcf_value = np.nan
-    if np.isfinite(fcf) and fcf > 0 and np.isfinite(shares) and shares > 0:
-        discount_rate, terminal_growth = 0.10, 0.03
-        if discount_rate > terminal_growth:
-            net_debt = (total_debt if np.isfinite(total_debt) else 0) - (cash if np.isfinite(cash) else 0)
-            dcf_value = (fcf * (1 + terminal_growth) / (discount_rate - terminal_growth) - net_debt) / shares
-            if dcf_value <= 0:
-                dcf_value = np.nan
-
-    methods = [
-        ("P/E 本益比", pe_value, "EPS × 現有預估／歷史本益比；虧損或 EPS 缺漏不適用"),
-        ("P/B 股價淨值比", pb_value, "每股淨值 × 現有 P/B；金融、資產型公司較常用"),
-        ("EV/EBITDA", ev_ebitda_value, "(EBITDA × EV/EBITDA − 淨負債) ÷ 股數"),
-        ("PEG 本益成長比", np.nan, "需可信的多年 EPS 成長預測與可比 PEG；單靠當期成長率不宜硬算股價"),
-        ("P/S 股價營收比", ps_value, "每股營收 × 現有 P/S；未反映獲利能力"),
-        ("EV/Sales 企業價值／營收", ev_sales_value, "(營收 × EV/Sales − 淨負債) ÷ 股數"),
-        ("RNAV 重估淨資產", np.nan, "需物業面積、區域市價及淨負債等資料，通用行情 API 不足"),
-        ("DDM 股利折現", ddm_value, "示範假設：股利成長 2%、折現率 10%；對股利穩定公司較適用"),
-        ("DCF 自由現金流折現", dcf_value, "簡化永續成長試算：FCF 成長 3%、折現率 10%；未建模逐年現金流"),
-        ("NAV 淨資產價值", np.nan, "需各項目未來現金流、銷售／開發時程及折現率，尤其適用地產開發商"),
-    ]
-    valuation_rows = []
-    for name, value, note in methods:
-        valuation_rows.append({"估值方法": name, "每股估值情境(元)": round(float(value), 2) if np.isfinite(value) else np.nan,
-                              "資料／適用性說明": note,
-                              "相對現價差幅(%)": round((value / price - 1) * 100, 2) if np.isfinite(value) and np.isfinite(price) and price > 0 else np.nan})
-
-    available = [row["每股估值情境(元)"] for row in valuation_rows if np.isfinite(row["每股估值情境(元)"]) and row["每股估值情境(元)"] > 0]
     return {
         "代號": symbol,
         "現價(財務來源)": price,
@@ -687,21 +623,9 @@ def fetch_fundamentals(symbol):
         "歷史本益比": pe_ttm,
         "預估本益比": pe_fwd,
         "P/B": pb,
-        "P/S": ps,
-        "PEG": peg,
-        "EV/EBITDA": ev_ebitda,
-        "EV/Sales": ev_sales,
-        "營收成長率": first_number(info, "revenueGrowth"),
-        "盈餘成長率": first_number(info, "earningsGrowth"),
-        "淨利率": first_number(info, "profitMargins"),
-        "ROE": first_number(info, "returnOnEquity"),
-        "負債權益比": first_number(info, "debtToEquity"),
+        "年度每股股利": dividend_rate,
         "股利殖利率": div_yield,
-        "估值方法表": pd.DataFrame(valuation_rows),
-        "可計算估值方法數": len(available),
-        "估值參考區間(非目標價)": (min(available), max(available)) if available else None,
-        "資料狀態": "財務欄位來自 Yahoo Finance，可能缺漏或延遲；估值為模型情境而非目標價",
-        "估值限制": "十種方法所需資料不同；未提供可靠資料者標示不可計算，不以任意假設補值。市場現有倍數不代表合理倍數。",
+        "資料狀態": "財務資料來自 Yahoo Finance，可能缺漏或延遲；請核對公司最新財報與股利公告。",
     }
 
 
@@ -862,43 +786,68 @@ def dataframe_csv_download(df, filename="tw_stock_scan.csv"):
 
 
 def render_fundamental(symbol):
-    with st.spinner("讀取財務資料並整理十種估值方法…"):
+    with st.spinner("讀取 EPS、每股淨值與年度股利資料…"):
         item = fetch_fundamentals(symbol)
-    if "估值方法表" not in item:
+    if "近四季EPS" not in item:
         st.error(item.get("資料狀態", "無法取得財務資料"))
         return item
-    st.markdown("### 🧮 公司估值分析｜十種估值方法")
-    st.caption("方法架構參考股感《股票估值怎麼算？10種必知的公司估值方法！》。每股估值是模型情境推算，不等於投資目標價。")
+
+    st.markdown("### 🧮 三種估值試算")
+    st.caption("已移除原本的十種估值；改用本益比法、股價淨值比法與殖利率法。估值取決於使用者設定的倍數／殖利率假設，不是保證價格或投資建議。")
+
     c1, c2, c3 = st.columns(3)
     c1.metric("近四季 EPS", fmt_price(item["近四季EPS"]))
     c2.metric("預估 EPS", fmt_price(item["預估EPS"]))
     c3.metric("每股淨值", fmt_price(item["每股淨值"]))
-    st.dataframe(item["估值方法表"], hide_index=True, use_container_width=True,
-                 column_config={
-                     "每股估值情境(元)": st.column_config.NumberColumn(format="%.2f"),
-                     "相對現價差幅(%)": st.column_config.NumberColumn(format="%.2f%%"),
-                 })
-    st.markdown("#### 市場估值與財務指標")
-    valuation = pd.DataFrame([
+
+    with st.expander("⚙️ 調整估值假設", expanded=True):
+        a, b, c = st.columns(3)
+        default_pe = item["預估本益比"] if np.isfinite(as_float(item["預估本益比"])) and 3 <= as_float(item["預估本益比"]) <= 40 else (item["歷史本益比"] if np.isfinite(as_float(item["歷史本益比"])) and 3 <= as_float(item["歷史本益比"]) <= 40 else 15.0)
+        default_pb = item["P/B"] if np.isfinite(as_float(item["P/B"])) and 0.3 <= as_float(item["P/B"]) <= 8 else 1.5
+        current_yield = item["股利殖利率"]
+        default_yield = min(max(current_yield * 100 if np.isfinite(as_float(current_yield)) and current_yield > 0 else 5.0, 1.0), 12.0)
+        target_pe = a.number_input("目標本益比（倍）", min_value=1.0, max_value=100.0, value=float(default_pe), step=0.5, key=f"target_pe_{symbol}")
+        target_pb = b.number_input("目標股價淨值比（倍）", min_value=0.1, max_value=20.0, value=float(default_pb), step=0.1, key=f"target_pb_{symbol}")
+        target_yield = c.number_input("目標殖利率（%）", min_value=0.5, max_value=20.0, value=float(default_yield), step=0.5, key=f"target_yield_{symbol}") / 100.0
+
+    eps = item["預估EPS"] if np.isfinite(as_float(item["預估EPS"])) and item["預估EPS"] > 0 else item["近四季EPS"]
+    pe_value = eps * target_pe if np.isfinite(as_float(eps)) and eps > 0 else np.nan
+    book = item["每股淨值"]
+    pb_value = book * target_pb if np.isfinite(as_float(book)) and book > 0 else np.nan
+    dividend = item["年度每股股利"]
+    yield_value = dividend / target_yield if np.isfinite(as_float(dividend)) and dividend > 0 and target_yield > 0 else np.nan
+    price = item["現價(財務來源)"]
+
+    rows = []
+    for name, value, formula, assumption in [
+        ("本益比法（P/E）", pe_value, f"EPS {fmt_price(eps)} × {target_pe:.1f} 倍", "虧損或 EPS 缺漏時無法計算；優先使用預估 EPS，否則使用近四季 EPS。"),
+        ("股價淨值比法（P/B）", pb_value, f"每股淨值 {fmt_price(book)} × {target_pb:.1f} 倍", "較適合金融業、資產型企業；帳面價值不一定等於實際可變現價值。"),
+        ("殖利率法", yield_value, f"年度每股股利 {fmt_price(dividend)} ÷ 目標殖利率 {target_yield:.1%}", "股利須可持續；未來配息可能變動或取消。"),
+    ]:
+        rows.append({
+            "估值方法": name,
+            "估值試算(元)": round(float(value), 2) if np.isfinite(as_float(value)) and value > 0 else np.nan,
+            "相對現價差幅(%)": round((value / price - 1) * 100, 2) if np.isfinite(as_float(value)) and value > 0 and np.isfinite(as_float(price)) and price > 0 else np.nan,
+            "計算方式／假設": formula if np.isfinite(as_float(value)) and value > 0 else "必要財務資料不足，無法計算",
+            "注意事項": assumption,
+        })
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True, column_config={
+        "估值試算(元)": st.column_config.NumberColumn(format="%.2f"),
+        "相對現價差幅(%)": st.column_config.NumberColumn(format="%.2f%%"),
+    })
+    st.markdown("#### 財務資料摘要")
+    summary = pd.DataFrame([
+        ("現價（財務來源）", fmt_price(price)),
         ("歷史本益比 P/E", fmt_price(item["歷史本益比"])),
         ("預估本益比 P/E", fmt_price(item["預估本益比"])),
-        ("股價淨值比 P/B", fmt_price(item["P/B"])),
-        ("股價營收比 P/S", fmt_price(item["P/S"])),
-        ("PEG", fmt_price(item["PEG"])),
-        ("EV/EBITDA", fmt_price(item["EV/EBITDA"])),
-        ("EV/Sales", fmt_price(item["EV/Sales"])),
-        ("營收成長率", f"{item['營收成長率']:.1%}" if np.isfinite(as_float(item["營收成長率"])) else "—"),
-        ("盈餘成長率", f"{item['盈餘成長率']:.1%}" if np.isfinite(as_float(item["盈餘成長率"])) else "—"),
-        ("淨利率", f"{item['淨利率']:.1%}" if np.isfinite(as_float(item["淨利率"])) else "—"),
-        ("ROE", f"{item['ROE']:.1%}" if np.isfinite(as_float(item["ROE"])) else "—"),
-        ("負債權益比", fmt_price(item["負債權益比"])),
-        ("股利殖利率", f"{item['股利殖利率']:.1%}" if np.isfinite(as_float(item["股利殖利率"])) else "—"),
+        ("目前股價淨值比 P/B", fmt_price(item["P/B"])),
+        ("年度每股股利", fmt_price(item["年度每股股利"])),
+        ("目前股利殖利率", f"{item['股利殖利率']:.2%}" if np.isfinite(as_float(item["股利殖利率"])) else "—"),
         ("資料狀態", item["資料狀態"]),
-        ("估值限制", item["估值限制"]),
     ], columns=["項目", "數值／說明"])
-    st.dataframe(valuation, hide_index=True, use_container_width=True)
-    st.caption("來源方法：" + "https://www.stockfeel.com.tw/10-%E7%A8%AE%E5%BF%85%E7%9F%A5%E7%9A%84%E5%85%AC%E5%8F%B8%E4%BC%B0%E5%80%BC%E6%96%B9%E6%B3%95/")
-    return item
+    st.dataframe(summary, hide_index=True, use_container_width=True)
+    st.caption("估值資料來源：Yahoo Finance。目標本益比、目標淨值比與目標殖利率均可自行調整；請勿將單一公式的結果視為確定合理價。")
+    return {**item, "三種估值表": pd.DataFrame(rows)}
 
 
 # ------------------------------
