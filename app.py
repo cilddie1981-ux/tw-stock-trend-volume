@@ -16,7 +16,7 @@ st.set_page_config(
 )
 
 st.title("📈 台股趨勢指標 3.0")
-st.caption("趨勢指標＋量價分析｜公開資料參考工具，非投資建議")
+st.caption("趨勢指標＋量價分析＋外資／法人動向｜公開資料參考工具，非投資建議")
 
 # ------------------------------
 # 基本設定與股票名稱別名
@@ -583,98 +583,6 @@ def analyze(symbol, period="1y"):
     return result
 
 
-def historical_dividend_yield_averages(ticker, current_price):
-    """估算近 1、3、5 年平均年度殖利率；以每年現金股利總額除以該年年末附近收盤價。"""
-    try:
-        dividends = ticker.dividends
-        hist = ticker.history(period="6y", auto_adjust=False)
-    except Exception:
-        dividends, hist = pd.Series(dtype=float), pd.DataFrame()
-
-    if dividends is None or len(dividends) == 0 or hist is None or hist.empty:
-        return {1: np.nan, 3: np.nan, 5: np.nan}, {1: np.nan, 3: np.nan, 5: np.nan}
-
-    dividends = pd.Series(dividends).dropna()
-    hist = hist.copy()
-    try:
-        dividends.index = pd.to_datetime(dividends.index).tz_localize(None)
-        hist.index = pd.to_datetime(hist.index).tz_localize(None)
-    except Exception:
-        pass
-    annual_dividends = dividends.groupby(dividends.index.year).sum()
-    annual_close = hist["Close"].dropna().groupby(hist["Close"].dropna().index.year).last()
-    current_year = datetime.now().year
-    avg_yields, avg_dividends = {}, {}
-    for years in (1, 3, 5):
-        # 使用最近完整年度，避免當年度尚未配息完畢而低估。
-        end_year = current_year - 1
-        start_year = end_year - years + 1
-        yields, divs = [], []
-        for year in range(start_year, end_year + 1):
-            annual_div = as_float(annual_dividends.get(year))
-            year_close = as_float(annual_close.get(year))
-            if np.isfinite(annual_div) and annual_div > 0:
-                divs.append(annual_div)
-                if np.isfinite(year_close) and year_close > 0:
-                    yields.append(annual_div / year_close * 100)
-        avg_yields[years] = float(np.mean(yields)) if yields else np.nan
-        avg_dividends[years] = float(np.mean(divs)) if divs else np.nan
-    return avg_yields, avg_dividends
-
-
-def fetch_fundamentals(symbol):
-    """取得計算本益比、股價淨值比、殖利率估值所需的基本財務資料。"""
-    symbol = resolve_symbol(symbol)
-    try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.get_info() or {}
-    except Exception as exc:
-        return {"代號": symbol, "資料狀態": f"財務資料讀取失敗：{exc}"}
-
-    def first_number(mapping, *keys):
-        for key in keys:
-            val = as_float(mapping.get(key))
-            if np.isfinite(val):
-                return val
-        return np.nan
-
-    price = first_number(info, "currentPrice", "regularMarketPrice")
-    eps_ttm = first_number(info, "trailingEps")
-    eps_fwd = first_number(info, "forwardEps")
-    pe_ttm = first_number(info, "trailingPE")
-    pe_fwd = first_number(info, "forwardPE")
-    book = first_number(info, "bookValue")
-    pb = first_number(info, "priceToBook")
-    dividend_rate = first_number(info, "dividendRate", "trailingAnnualDividendRate")
-    div_yield = first_number(info, "dividendYield")
-    # 若 API 未提供年度股利，但有殖利率與現價，反推年度股利；僅作資料備援。
-    if (not np.isfinite(dividend_rate) or dividend_rate <= 0) and np.isfinite(price) and price > 0 and np.isfinite(div_yield) and div_yield > 0:
-        dividend_rate = price * div_yield
-    if (not np.isfinite(div_yield) or div_yield <= 0) and np.isfinite(price) and price > 0 and np.isfinite(dividend_rate) and dividend_rate > 0:
-        div_yield = dividend_rate / price
-    avg_yields, avg_dividends = historical_dividend_yield_averages(ticker, price)
-
-    return {
-        "代號": symbol,
-        "現價(財務來源)": price,
-        "近四季EPS": eps_ttm,
-        "預估EPS": eps_fwd,
-        "每股淨值": book,
-        "歷史本益比": pe_ttm,
-        "預估本益比": pe_fwd,
-        "P/B": pb,
-        "年度每股股利": dividend_rate,
-        "股利殖利率": div_yield,
-        "近1年平均殖利率(%)": avg_yields[1],
-        "近3年平均殖利率(%)": avg_yields[3],
-        "近5年平均殖利率(%)": avg_yields[5],
-        "近1年平均年度股利": avg_dividends[1],
-        "近3年平均年度股利": avg_dividends[3],
-        "近5年平均年度股利": avg_dividends[5],
-        "資料狀態": "財務資料來自 Yahoo Finance；歷史平均殖利率以最近完整年度每年現金股利總額／年末附近收盤價計算，資料可能缺漏或延遲。",
-    }
-
-
 def technical_score(item):
     score = 0
     trend = str(item.get("趨勢", ""))
@@ -824,80 +732,139 @@ def dataframe_csv_download(df, filename="tw_stock_scan.csv"):
     st.download_button("⬇️ 下載 CSV", data=csv, file_name=filename, mime="text/csv")
 
 
-def render_fundamental(symbol):
-    with st.spinner("讀取 EPS、每股淨值與年度股利資料…"):
-        item = fetch_fundamentals(symbol)
-    if "近四季EPS" not in item:
-        st.error(item.get("資料狀態", "無法取得財務資料"))
-        return item
+def fetch_institutional_data(symbol):
+    """取得法人目標價（若 Yahoo Finance 有提供）及官方三大法人最新買賣超。"""
+    code = resolve_symbol(symbol).split(".")[0]
+    result = {"代號": code, "目標價資料": {}, "法人買賣超": None, "資料日期": "—", "資料來源狀態": []}
 
-    st.markdown("### 🧮 三種估值試算")
-    st.caption("已移除原本的十種估值；改用本益比法、股價淨值比法與殖利率法。估值取決於使用者設定的倍數／殖利率假設，不是保證價格或投資建議。")
+    # 分析師目標價由 Yahoo Finance 提供；不同股票可能沒有資料。
+    try:
+        ticker = yf.Ticker(resolve_symbol(symbol))
+        targets = getattr(ticker, "analyst_price_targets", None)
+        if callable(targets):
+            targets = targets()
+        if isinstance(targets, dict) and targets:
+            result["目標價資料"] = {
+                "平均目標價": as_float(targets.get("mean")),
+                "中位數目標價": as_float(targets.get("median")),
+                "最低目標價": as_float(targets.get("low")),
+                "最高目標價": as_float(targets.get("high")),
+                "分析師數": as_float(targets.get("numberOfAnalysts")),
+            }
+        result["分析師建議"] = getattr(ticker, "recommendations_summary", None)
+        if result["分析師建議"] is None:
+            result["分析師建議"] = getattr(ticker, "recommendations", None)
+    except Exception as exc:
+        result["資料來源狀態"].append(f"分析師目標價暫時無法讀取：{exc}")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("近四季 EPS", fmt_price(item["近四季EPS"]))
-    c2.metric("預估 EPS", fmt_price(item["預估EPS"]))
-    c3.metric("每股淨值", fmt_price(item["每股淨值"]))
-
-    with st.expander("⚙️ 調整估值假設", expanded=True):
-        a, b, c = st.columns(3)
-        default_pe = item["預估本益比"] if np.isfinite(as_float(item["預估本益比"])) and 3 <= as_float(item["預估本益比"]) <= 40 else (item["歷史本益比"] if np.isfinite(as_float(item["歷史本益比"])) and 3 <= as_float(item["歷史本益比"]) <= 40 else 15.0)
-        default_pb = item["P/B"] if np.isfinite(as_float(item["P/B"])) and 0.3 <= as_float(item["P/B"]) <= 8 else 1.5
-        current_yield = item["股利殖利率"]
-        default_yield = min(max(current_yield * 100 if np.isfinite(as_float(current_yield)) and current_yield > 0 else 5.0, 1.0), 12.0)
-        target_pe = a.number_input("目標本益比（倍）", min_value=1.0, max_value=100.0, value=float(default_pe), step=0.5, key=f"target_pe_{symbol}")
-        target_pb = b.number_input("目標股價淨值比（倍）", min_value=0.1, max_value=20.0, value=float(default_pb), step=0.1, key=f"target_pb_{symbol}")
-        target_yield = c.number_input("殖利率估值門檻（%）", min_value=0.5, max_value=20.0, value=float(default_yield), step=0.5, key=f"target_yield_{symbol}") / 100.0
-
-    eps = item["預估EPS"] if np.isfinite(as_float(item["預估EPS"])) and item["預估EPS"] > 0 else item["近四季EPS"]
-    pe_value = eps * target_pe if np.isfinite(as_float(eps)) and eps > 0 else np.nan
-    book = item["每股淨值"]
-    pb_value = book * target_pb if np.isfinite(as_float(book)) and book > 0 else np.nan
-    dividend = item["年度每股股利"]
-    price = item["現價(財務來源)"]
-
-    rows = []
-    valuation_rows = [
-        ("本益比法（P/E）", pe_value, f"EPS {fmt_price(eps)} × {target_pe:.1f} 倍", "虧損或 EPS 缺漏時無法計算；優先使用預估 EPS，否則使用近四季 EPS。"),
-        ("股價淨值比法（P/B）", pb_value, f"每股淨值 {fmt_price(book)} × {target_pb:.1f} 倍", "較適合金融業、資產型企業；帳面價值不一定等於實際可變現價值。"),
+    # 先讀 TWSE 官方 OpenAPI（上市股）；若未命中，再嘗試 TPEx 官方 OpenAPI（上櫃股）。
+    endpoints = [
+        ("TWSE 證交所", "https://openapi.twse.com.tw/v1/exchangeReport/TWT38U"),
+        ("TPEx 櫃買中心", "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_3insti"),
     ]
-    for years in (1, 3, 5):
-        avg_dividend = item.get(f"近{years}年平均年度股利", np.nan)
-        avg_yield = item.get(f"近{years}年平均殖利率(%)", np.nan)
-        yield_value = avg_dividend / target_yield if np.isfinite(as_float(avg_dividend)) and avg_dividend > 0 and target_yield > 0 else np.nan
-        valuation_rows.append((
-            f"殖利率法（近{years}年平均）", yield_value,
-            f"近{years}年平均年度股利 {fmt_price(avg_dividend)} ÷ 殖利率門檻 {target_yield:.1%}；歷史平均殖利率 {avg_yield:.2f}%" if np.isfinite(as_float(avg_yield)) else f"近{years}年平均年度股利 {fmt_price(avg_dividend)} ÷ 殖利率門檻 {target_yield:.1%}；平均殖利率資料不足",
-            "以近 1／3／5 年每年現金股利及歷史股價分別計算；股利可能變動，歷史殖利率不代表未來。"
-        ))
-    for name, value, formula, assumption in valuation_rows:
-        rows.append({
-            "估值方法": name,
-            "估值試算(元)": round(float(value), 2) if np.isfinite(as_float(value)) and value > 0 else np.nan,
-            "相對現價差幅(%)": round((value / price - 1) * 100, 2) if np.isfinite(as_float(value)) and value > 0 and np.isfinite(as_float(price)) and price > 0 else np.nan,
-            "計算方式／假設": formula if np.isfinite(as_float(value)) and value > 0 else "必要財務資料不足，無法計算",
-            "注意事項": assumption,
-        })
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True, column_config={
-        "估值試算(元)": st.column_config.NumberColumn(format="%.2f"),
-        "相對現價差幅(%)": st.column_config.NumberColumn(format="%.2f%%"),
-    })
-    st.markdown("#### 財務資料摘要")
-    summary = pd.DataFrame([
-        ("現價（財務來源）", fmt_price(price)),
-        ("歷史本益比 P/E", fmt_price(item["歷史本益比"])),
-        ("預估本益比 P/E", fmt_price(item["預估本益比"])),
-        ("目前股價淨值比 P/B", fmt_price(item["P/B"])),
-        ("年度每股股利", fmt_price(item["年度每股股利"])),
-        ("目前股利殖利率", f"{item['股利殖利率']:.2%}" if np.isfinite(as_float(item["股利殖利率"])) else "—"),
-        ("近1年平均殖利率", f"{item['近1年平均殖利率(%)']:.2f}%" if np.isfinite(as_float(item["近1年平均殖利率(%)"])) else "資料不足"),
-        ("近3年平均殖利率", f"{item['近3年平均殖利率(%)']:.2f}%" if np.isfinite(as_float(item["近3年平均殖利率(%)"])) else "資料不足"),
-        ("近5年平均殖利率", f"{item['近5年平均殖利率(%)']:.2f}%" if np.isfinite(as_float(item["近5年平均殖利率(%)"])) else "資料不足"),
-        ("資料狀態", item["資料狀態"]),
-    ], columns=["項目", "數值／說明"])
-    st.dataframe(summary, hide_index=True, use_container_width=True)
-    st.caption("估值資料來源：Yahoo Finance。殖利率法分別採近 1、3、5 年平均年度股利與平均殖利率呈現；目標本益比、目標淨值比與殖利率門檻均可自行調整，結果不是保證價格。")
-    return {**item, "三種估值表": pd.DataFrame(rows)}
+    for label, url in endpoints:
+        try:
+            response = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict):
+                payload = payload.get("data", payload.get("result", []))
+            if not isinstance(payload, list) or not payload:
+                continue
+            row = None
+            for candidate in payload:
+                if not isinstance(candidate, dict):
+                    continue
+                normalized = {str(k).strip().replace(" ", ""): v for k, v in candidate.items()}
+                stock_code = next((str(v).strip() for k, v in normalized.items() if any(t in k for t in ("證券代號", "股票代號", "代號", "SecuritiesCompanyCode", "Code"))), "")
+                if stock_code == code:
+                    row = normalized
+                    break
+            if row is None:
+                continue
+
+            def find_value(tokens):
+                for key, value in row.items():
+                    if any(token in key for token in tokens):
+                        val = as_float(str(value).replace(",", ""))
+                        if np.isfinite(val):
+                            return val
+                return np.nan
+
+            foreign = find_value(("外陸資買賣超股數", "外資買賣超", "ForeignInvestorNet"))
+            trust = find_value(("投信買賣超股數", "投信買賣超", "InvestmentTrustNet"))
+            dealer = find_value(("自營商買賣超股數", "自營商買賣超", "DealerNet"))
+            total = find_value(("三大法人買賣超股數", "三大法人買賣超", "TotalNet"))
+            date = next((str(v) for k, v in row.items() if "日期" in k or "Date" in k), "最新交易日（API 未提供日期欄）")
+            result["法人買賣超"] = {
+                "外資買賣超(股)": foreign,
+                "投信買賣超(股)": trust,
+                "自營商買賣超(股)": dealer,
+                "三大法人合計(股)": total,
+            }
+            result["資料日期"] = date
+            result["法人來源"] = label
+            break
+        except Exception as exc:
+            result["資料來源狀態"].append(f"{label}資料讀取失敗：{exc}")
+
+    if result["法人買賣超"] is None:
+        result["資料來源狀態"].append("目前無法取得該股最新法人買賣超資料；請稍後重試或使用官方網站查詢。")
+    if not result["目標價資料"]:
+        result["資料來源狀態"].append("Yahoo Finance 未提供此股分析師目標價；不以技術目標價冒充法人目標價。")
+    return result
+
+
+def _fmt_shares(value):
+    value = as_float(value)
+    if not np.isfinite(value):
+        return "資料不足"
+    return f"{value:+,.0f} 股"
+
+
+def render_institutional(symbol, current_price=None):
+    st.markdown("### 🏦 外資／法人目標價與資金流向")
+    with st.spinner("讀取分析師目標價及三大法人買賣超資料…"):
+        data = fetch_institutional_data(symbol)
+
+    targets = data.get("目標價資料", {})
+    if targets:
+        mean_target = as_float(targets.get("平均目標價"))
+        median_target = as_float(targets.get("中位數目標價"))
+        low_target = as_float(targets.get("最低目標價"))
+        high_target = as_float(targets.get("最高目標價"))
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("分析師平均目標價", fmt_price(mean_target), f"較現價 {(mean_target / current_price - 1) * 100:+.1f}%" if np.isfinite(mean_target) and np.isfinite(as_float(current_price)) and current_price > 0 else None)
+        c2.metric("目標價中位數", fmt_price(median_target))
+        c3.metric("最低目標價", fmt_price(low_target))
+        c4.metric("最高目標價", fmt_price(high_target))
+        if np.isfinite(as_float(targets.get("分析師數"))):
+            st.caption(f"分析師數：{int(targets['分析師數'])}（資料供應商欄位可能不完整；目標價不等同外資保證價）")
+    else:
+        st.info("目前沒有可用的分析師目標價資料。此欄只顯示資料供應商實際提供的分析師目標價，不會自行編造法人目標價。")
+
+    flows = data.get("法人買賣超")
+    if flows:
+        st.markdown(f"#### 三大法人最新買賣超｜{data.get('資料日期', '最新交易日')}｜來源：{data.get('法人來源', '官方公開資料')} ")
+        flow_rows = []
+        for name in ("外資買賣超(股)", "投信買賣超(股)", "自營商買賣超(股)", "三大法人合計(股)"):
+            value = as_float(flows.get(name))
+            direction = "買超" if np.isfinite(value) and value > 0 else "賣超" if np.isfinite(value) and value < 0 else "接近平衡／資料不足"
+            flow_rows.append({"法人類別": name.replace("(股)", ""), "買賣超股數": _fmt_shares(value), "資金方向": direction})
+        st.dataframe(pd.DataFrame(flow_rows), hide_index=True, use_container_width=True)
+        total = as_float(flows.get("三大法人合計(股)"))
+        if np.isfinite(total) and total > 0:
+            st.success("最新可取得資料顯示三大法人合計買超。單日買超不代表持續流入，建議搭配連續多日資料及股價量能確認。")
+        elif np.isfinite(total) and total < 0:
+            st.warning("最新可取得資料顯示三大法人合計賣超，留意是否與股價轉弱及放量下跌同步。")
+    else:
+        st.info("尚未取得此股最新法人買賣超數值。可直接查閱官方資料：證交所三大法人買賣超日報、櫃買中心三大法人買賣明細。")
+        st.markdown("- [證交所三大法人買賣超日報](https://www.twse.com.tw/zh/trading/foreign/t86.html)\n- [櫃買中心三大法人買賣明細](https://www.tpex.org.tw/zh-tw/mainboard/trading/major-institutional/3itrade/day.html)")
+
+    for message in data.get("資料來源狀態", []):
+        st.caption(message)
+    st.caption("目標價為第三方資料供應商所彙整的分析師預估，未必全部是外資券商報告，可能延遲或缺漏；法人買賣超以交易所／櫃買中心公布資料為準。資金流向以買賣超股數呈現，並非完整資金流入金額。")
+    return data
 
 
 # ------------------------------
@@ -949,7 +916,7 @@ if page == "個股分析":
             result = analyze(query, period_map[period_label])
         show_analysis(result)
         if not result.get("error"):
-            render_fundamental(result["代號"])
+            render_institutional(result["代號"], result.get("現價"))
 
 # ------------------------------
 # 2. 上市櫃全市場掃描
