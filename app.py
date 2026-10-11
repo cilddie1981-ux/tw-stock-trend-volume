@@ -583,6 +583,45 @@ def analyze(symbol, period="1y"):
     return result
 
 
+def historical_dividend_yield_averages(ticker, current_price):
+    """估算近 1、3、5 年平均年度殖利率；以每年現金股利總額除以該年年末附近收盤價。"""
+    try:
+        dividends = ticker.dividends
+        hist = ticker.history(period="6y", auto_adjust=False)
+    except Exception:
+        dividends, hist = pd.Series(dtype=float), pd.DataFrame()
+
+    if dividends is None or len(dividends) == 0 or hist is None or hist.empty:
+        return {1: np.nan, 3: np.nan, 5: np.nan}, {1: np.nan, 3: np.nan, 5: np.nan}
+
+    dividends = pd.Series(dividends).dropna()
+    hist = hist.copy()
+    try:
+        dividends.index = pd.to_datetime(dividends.index).tz_localize(None)
+        hist.index = pd.to_datetime(hist.index).tz_localize(None)
+    except Exception:
+        pass
+    annual_dividends = dividends.groupby(dividends.index.year).sum()
+    annual_close = hist["Close"].dropna().groupby(hist["Close"].dropna().index.year).last()
+    current_year = datetime.now().year
+    avg_yields, avg_dividends = {}, {}
+    for years in (1, 3, 5):
+        # 使用最近完整年度，避免當年度尚未配息完畢而低估。
+        end_year = current_year - 1
+        start_year = end_year - years + 1
+        yields, divs = [], []
+        for year in range(start_year, end_year + 1):
+            annual_div = as_float(annual_dividends.get(year))
+            year_close = as_float(annual_close.get(year))
+            if np.isfinite(annual_div) and annual_div > 0:
+                divs.append(annual_div)
+                if np.isfinite(year_close) and year_close > 0:
+                    yields.append(annual_div / year_close * 100)
+        avg_yields[years] = float(np.mean(yields)) if yields else np.nan
+        avg_dividends[years] = float(np.mean(divs)) if divs else np.nan
+    return avg_yields, avg_dividends
+
+
 def fetch_fundamentals(symbol):
     """取得計算本益比、股價淨值比、殖利率估值所需的基本財務資料。"""
     symbol = resolve_symbol(symbol)
@@ -613,6 +652,7 @@ def fetch_fundamentals(symbol):
         dividend_rate = price * div_yield
     if (not np.isfinite(div_yield) or div_yield <= 0) and np.isfinite(price) and price > 0 and np.isfinite(dividend_rate) and dividend_rate > 0:
         div_yield = dividend_rate / price
+    avg_yields, avg_dividends = historical_dividend_yield_averages(ticker, price)
 
     return {
         "代號": symbol,
@@ -625,7 +665,13 @@ def fetch_fundamentals(symbol):
         "P/B": pb,
         "年度每股股利": dividend_rate,
         "股利殖利率": div_yield,
-        "資料狀態": "財務資料來自 Yahoo Finance，可能缺漏或延遲；請核對公司最新財報與股利公告。",
+        "近1年平均殖利率(%)": avg_yields[1],
+        "近3年平均殖利率(%)": avg_yields[3],
+        "近5年平均殖利率(%)": avg_yields[5],
+        "近1年平均年度股利": avg_dividends[1],
+        "近3年平均年度股利": avg_dividends[3],
+        "近5年平均年度股利": avg_dividends[5],
+        "資料狀態": "財務資料來自 Yahoo Finance；歷史平均殖利率以最近完整年度每年現金股利總額／年末附近收盤價計算，資料可能缺漏或延遲。",
     }
 
 
@@ -739,13 +785,6 @@ def show_analysis(result):
     st.warning("以上買點、停損與目標價均為依歷史價格推算的技術參考，不是保證成交價。下單前請確認最新行情、跳動單位、流動性與自身風險承受度。")
 
     df = result["_df"]
-    st.markdown("### 📉 價格與均線")
-    chart_df = df[["Close", "MA5", "MA10", "MA20", "MA60"]].tail(120).rename(
-        columns={"Close": "收盤價", "MA5": "MA5", "MA10": "MA10", "MA20": "MA20", "MA60": "MA60"}
-    )
-    st.line_chart(chart_df, use_container_width=True)
-    st.markdown("### 成交量")
-    st.bar_chart(df[["Volume"]].tail(60).rename(columns={"Volume": "成交量"}), use_container_width=True)
 
 
 def scan_market(market_df, limit, scan_label):
@@ -808,22 +847,30 @@ def render_fundamental(symbol):
         default_yield = min(max(current_yield * 100 if np.isfinite(as_float(current_yield)) and current_yield > 0 else 5.0, 1.0), 12.0)
         target_pe = a.number_input("目標本益比（倍）", min_value=1.0, max_value=100.0, value=float(default_pe), step=0.5, key=f"target_pe_{symbol}")
         target_pb = b.number_input("目標股價淨值比（倍）", min_value=0.1, max_value=20.0, value=float(default_pb), step=0.1, key=f"target_pb_{symbol}")
-        target_yield = c.number_input("目標殖利率（%）", min_value=0.5, max_value=20.0, value=float(default_yield), step=0.5, key=f"target_yield_{symbol}") / 100.0
+        target_yield = c.number_input("殖利率估值門檻（%）", min_value=0.5, max_value=20.0, value=float(default_yield), step=0.5, key=f"target_yield_{symbol}") / 100.0
 
     eps = item["預估EPS"] if np.isfinite(as_float(item["預估EPS"])) and item["預估EPS"] > 0 else item["近四季EPS"]
     pe_value = eps * target_pe if np.isfinite(as_float(eps)) and eps > 0 else np.nan
     book = item["每股淨值"]
     pb_value = book * target_pb if np.isfinite(as_float(book)) and book > 0 else np.nan
     dividend = item["年度每股股利"]
-    yield_value = dividend / target_yield if np.isfinite(as_float(dividend)) and dividend > 0 and target_yield > 0 else np.nan
     price = item["現價(財務來源)"]
 
     rows = []
-    for name, value, formula, assumption in [
+    valuation_rows = [
         ("本益比法（P/E）", pe_value, f"EPS {fmt_price(eps)} × {target_pe:.1f} 倍", "虧損或 EPS 缺漏時無法計算；優先使用預估 EPS，否則使用近四季 EPS。"),
         ("股價淨值比法（P/B）", pb_value, f"每股淨值 {fmt_price(book)} × {target_pb:.1f} 倍", "較適合金融業、資產型企業；帳面價值不一定等於實際可變現價值。"),
-        ("殖利率法", yield_value, f"年度每股股利 {fmt_price(dividend)} ÷ 目標殖利率 {target_yield:.1%}", "股利須可持續；未來配息可能變動或取消。"),
-    ]:
+    ]
+    for years in (1, 3, 5):
+        avg_dividend = item.get(f"近{years}年平均年度股利", np.nan)
+        avg_yield = item.get(f"近{years}年平均殖利率(%)", np.nan)
+        yield_value = avg_dividend / target_yield if np.isfinite(as_float(avg_dividend)) and avg_dividend > 0 and target_yield > 0 else np.nan
+        valuation_rows.append((
+            f"殖利率法（近{years}年平均）", yield_value,
+            f"近{years}年平均年度股利 {fmt_price(avg_dividend)} ÷ 殖利率門檻 {target_yield:.1%}；歷史平均殖利率 {avg_yield:.2f}%" if np.isfinite(as_float(avg_yield)) else f"近{years}年平均年度股利 {fmt_price(avg_dividend)} ÷ 殖利率門檻 {target_yield:.1%}；平均殖利率資料不足",
+            "以近 1／3／5 年每年現金股利及歷史股價分別計算；股利可能變動，歷史殖利率不代表未來。"
+        ))
+    for name, value, formula, assumption in valuation_rows:
         rows.append({
             "估值方法": name,
             "估值試算(元)": round(float(value), 2) if np.isfinite(as_float(value)) and value > 0 else np.nan,
@@ -843,10 +890,13 @@ def render_fundamental(symbol):
         ("目前股價淨值比 P/B", fmt_price(item["P/B"])),
         ("年度每股股利", fmt_price(item["年度每股股利"])),
         ("目前股利殖利率", f"{item['股利殖利率']:.2%}" if np.isfinite(as_float(item["股利殖利率"])) else "—"),
+        ("近1年平均殖利率", f"{item['近1年平均殖利率(%)']:.2f}%" if np.isfinite(as_float(item["近1年平均殖利率(%)"])) else "資料不足"),
+        ("近3年平均殖利率", f"{item['近3年平均殖利率(%)']:.2f}%" if np.isfinite(as_float(item["近3年平均殖利率(%)"])) else "資料不足"),
+        ("近5年平均殖利率", f"{item['近5年平均殖利率(%)']:.2f}%" if np.isfinite(as_float(item["近5年平均殖利率(%)"])) else "資料不足"),
         ("資料狀態", item["資料狀態"]),
     ], columns=["項目", "數值／說明"])
     st.dataframe(summary, hide_index=True, use_container_width=True)
-    st.caption("估值資料來源：Yahoo Finance。目標本益比、目標淨值比與目標殖利率均可自行調整；請勿將單一公式的結果視為確定合理價。")
+    st.caption("估值資料來源：Yahoo Finance。殖利率法分別採近 1、3、5 年平均年度股利與平均殖利率呈現；目標本益比、目標淨值比與殖利率門檻均可自行調整，結果不是保證價格。")
     return {**item, "三種估值表": pd.DataFrame(rows)}
 
 
