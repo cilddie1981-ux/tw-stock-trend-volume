@@ -241,45 +241,59 @@ def calculate_indicators(df):
 
 
 
+def _direction_scores(df):
+    """只使用當日可得技術指標建立簡化分數。"""
+    close = df["Close"].astype(float)
+    score = pd.Series(0, index=df.index, dtype=float)
+    score += (close > df["MA20"]).astype(int)
+    score += (df["MA20"] > df["MA60"]).astype(int)
+    score += (df["MACD_HIST"] > 0).astype(int)
+    score += ((df["RSI"] >= 50) & (df["RSI"] < 75)).astype(int)
+    score += (df["K"] > df["D"]).astype(int)
+    score += (df["VOL_MA5"] >= df["VOL_MA10"]).astype(int)
+    score -= (close < df["MA20"]).astype(int)
+    score -= (df["MA20"] < df["MA60"]).astype(int)
+    score -= (df["MACD_HIST"] < 0).astype(int)
+    score -= (df["RSI"] < 45).astype(int)
+    score -= (df["K"] < df["D"]).astype(int)
+    score -= (df["VOL_MA5"] < df["VOL_MA10"] * 0.8).astype(int)
+    return score
+
+
+def _direction_labels(returns, horizon):
+    """用隨週期調整的報酬門檻定義上漲、下跌與盤整。"""
+    threshold = 0.01 * np.sqrt(max(horizon, 1) / 5.0)
+    labels = pd.Series("盤整", index=returns.index, dtype=object)
+    labels.loc[returns > threshold] = "上漲"
+    labels.loc[returns < -threshold] = "下跌"
+    return labels, threshold
+
+
 def estimate_direction_probability(df, horizon=5):
-    """以歷史相似技術條件的未來報酬，估算方向頻率；不是經校準的預測模型。"""
-    data = df.copy()
-    close = data["Close"].astype(float)
-    score = pd.Series(0, index=data.index, dtype=float)
-
-    # 以可解釋的技術條件建立每日分數，避免使用未來資料作為當日特徵。
-    score += (close > data["MA20"]).astype(int)
-    score += (data["MA20"] > data["MA60"]).astype(int)
-    score += (data["MACD_HIST"] > 0).astype(int)
-    score += ((data["RSI"] >= 50) & (data["RSI"] < 75)).astype(int)
-    score += (data["K"] > data["D"]).astype(int)
-    score += (data["VOL_MA5"] >= data["VOL_MA10"]).astype(int)
-    score -= (close < data["MA20"]).astype(int)
-    score -= (data["MA20"] < data["MA60"]).astype(int)
-    score -= (data["MACD_HIST"] < 0).astype(int)
-    score -= (data["RSI"] < 45).astype(int)
-    score -= (data["K"] < data["D"]).astype(int)
-    score -= (data["VOL_MA5"] < data["VOL_MA10"] * 0.8).astype(int)
-
-    # 歷史樣本必須已經走完未來 horizon 個交易日，避免把尚未發生的報酬算入樣本。
+    """估算方向頻率；樣本不足時只提供技術傾向，不稱為統計機率。"""
+    close = df["Close"].astype(float)
+    score = _direction_scores(df)
     future_return = close.shift(-horizon) / close - 1
-    current_score = as_float(score.iloc[-1], 0)
+    # 最後 horizon 筆尚無完整未來報酬，不能放進歷史樣本。
     historical = pd.DataFrame({"score": score, "future_return": future_return}).iloc[:-horizon].dropna()
+    labels, threshold = _direction_labels(historical["future_return"], horizon)
+    historical = historical.assign(label=labels)
+    current_score = as_float(score.iloc[-1], 0)
     similar = historical[historical["score"].sub(current_score).abs() <= 1]
     sample_count = len(similar)
 
     if sample_count >= 20:
-        up = float((similar["future_return"] > 0).mean() * 100)
-        down = float((similar["future_return"] < 0).mean() * 100)
-        flat = max(0.0, 100.0 - up - down)
-        method = "歷史相似技術分數樣本頻率"
+        frequencies = similar["label"].value_counts(normalize=True) * 100
+        up = float(frequencies.get("上漲", 0.0))
+        down = float(frequencies.get("下跌", 0.0))
+        flat = float(frequencies.get("盤整", 0.0))
+        method = "歷史相似技術分數頻率（非校準模型）"
     else:
-        # 樣本不足時只提供明確標示的指標分數傾向，不假裝是歷史統計機率。
         clipped = float(np.clip(current_score, -6, 6))
         up = float(np.clip(50 + clipped * 4, 26, 74))
         down = 100.0 - up
         flat = 0.0
-        method = "樣本不足：技術分數換算的方向傾向，非統計機率"
+        method = "歷史相似樣本不足：技術分數方向傾向，非統計機率"
 
     return {
         "預測週期": f"未來 {horizon} 個交易日",
@@ -289,6 +303,58 @@ def estimate_direction_probability(df, horizon=5):
         "相似歷史樣本數": sample_count,
         "方向估計方法": method,
         "技術分數": int(current_score),
+        "盤整門檻(%)": round(threshold * 100, 2),
+    }
+
+
+def backtest_direction_estimates(df, horizon=5, max_signals=180):
+    """簡易逐日向前回測；每個訊號只使用當時以前已完成的結果。"""
+    if len(df) < horizon + 80:
+        return {"週期": horizon, "回測訊號數": 0, "方向命中率(%)": np.nan,
+                "上漲判斷精確率(%)": np.nan, "回測說明": "歷史資料不足，無法進行有意義的逐日回測。"}
+
+    close = df["Close"].astype(float)
+    scores = _direction_scores(df)
+    future_returns = close.shift(-horizon) / close - 1
+    actual_labels, threshold = _direction_labels(future_returns, horizon)
+    first = max(60, len(df) - max_signals - horizon)
+    predictions, actuals = [], []
+
+    for i in range(first, len(df) - horizon):
+        current_score = as_float(scores.iloc[i], np.nan)
+        if not np.isfinite(current_score) or pd.isna(actual_labels.iloc[i]):
+            continue
+        # 只使用在訊號日 i 之前，且未來 horizon 日已走完的歷史樣本。
+        hist_end = i - horizon
+        if hist_end <= 0:
+            continue
+        past = pd.DataFrame({"score": scores.iloc[:hist_end],
+                             "future_return": future_returns.iloc[:hist_end]}).dropna()
+        past_labels, _ = _direction_labels(past["future_return"], horizon)
+        past = past.assign(label=past_labels)
+        similar = past[past["score"].sub(current_score).abs() <= 1]
+        if len(similar) >= 20:
+            pred = similar["label"].value_counts().reindex(["上漲", "下跌", "盤整"], fill_value=0).idxmax()
+        else:
+            # 樣本不足時用分數方向作可重現的簡化分類，不冒充機率模型。
+            pred = "上漲" if current_score > 0 else ("下跌" if current_score < 0 else "盤整")
+        predictions.append(pred)
+        actuals.append(actual_labels.iloc[i])
+
+    n = len(actuals)
+    if n == 0:
+        accuracy = up_precision = np.nan
+    else:
+        accuracy = float(np.mean(np.array(predictions) == np.array(actuals)) * 100)
+        up_idx = [i for i, p in enumerate(predictions) if p == "上漲"]
+        up_precision = float(np.mean([actuals[i] == "上漲" for i in up_idx]) * 100) if up_idx else np.nan
+
+    return {
+        "週期": horizon,
+        "回測訊號數": n,
+        "方向命中率(%)": round(accuracy, 1) if np.isfinite(accuracy) else np.nan,
+        "上漲判斷精確率(%)": round(up_precision, 1) if np.isfinite(up_precision) else np.nan,
+        "回測說明": f"逐日向前測試；盤整門檻 ±{threshold * 100:.2f}%，樣本不足時採技術分數分類。歷史命中率不代表未來表現。",
     }
 
 def _round_price(value):
@@ -324,7 +390,9 @@ def analyze(symbol, period="1y"):
         return {"error": f"{used_symbol} 僅取得 {len(raw)} 筆日線資料，少於 60 筆，無法完整判斷中長期均線。"}
 
     df = calculate_indicators(raw)
-    probability = estimate_direction_probability(df, horizon=5)
+    probabilities = {h: estimate_direction_probability(df, horizon=h) for h in (5, 10, 20)}
+    backtests = {h: backtest_direction_estimates(df, horizon=h) for h in (5, 10, 20)}
+    probability = probabilities[5]
     last = df.iloc[-1]
     prev = df.iloc[-2]
     price = as_float(last["Close"])
@@ -508,6 +576,8 @@ def analyze(symbol, period="1y"):
         "價格計算檢查": "；".join(checks),
         "目前訊號": signal,
         **probability,
+        "多週期方向估計": probabilities,
+        "方向回測": backtests,
         "_df": df,
     }
     return result
@@ -619,16 +689,36 @@ def show_analysis(result):
     c3.metric("位置", result["位置"])
     c4.metric("目前訊號", result["目前訊號"])
 
-    st.markdown("### 🔮 未來 5 個交易日方向估計")
-    p1, p2, p3 = st.columns(3)
-    p1.metric("上漲機率／傾向", f"{result['上漲機率(%)']:.1f}%")
-    p2.metric("下跌機率／傾向", f"{result['下跌機率(%)']:.1f}%")
-    p3.metric("盤整機率", f"{result['盤整機率(%)']:.1f}%")
+    st.markdown("### 🔮 多週期漲跌方向估計")
+    prob_rows = []
+    for horizon in (5, 10, 20):
+        item = result["多週期方向估計"][horizon]
+        prob_rows.append({
+            "週期": item["預測週期"],
+            "上漲機率／傾向": f"{item['上漲機率(%)']:.1f}%",
+            "下跌機率／傾向": f"{item['下跌機率(%)']:.1f}%",
+            "盤整機率": f"{item['盤整機率(%)']:.1f}%",
+            "相似歷史樣本數": item["相似歷史樣本數"],
+            "估計方式": item["方向估計方法"],
+        })
+    st.dataframe(pd.DataFrame(prob_rows), hide_index=True, use_container_width=True)
     st.caption(
-        f"估計方式：{result['方向估計方法']}；相似歷史樣本數：{result['相似歷史樣本數']}；"
-        f"技術分數：{result['技術分數']}。此結果是歷史方向頻率或指標傾向，不是經校準的預測模型，"
-        "不代表實際未來必然如此，也未納入突發消息、財報、政策及大盤變化。"
+        f"5日估計技術分數：{result['技術分數']}。盤整定義為週期報酬落在門檻內；歷史樣本不足時只顯示方向傾向，"
+        "不代表經校準的真實機率。估計未納入突發消息、財報、政策及大盤變化。"
     )
+
+    st.markdown("### 🧪 歷史逐日向前回測（非未來保證）")
+    bt_rows = []
+    for horizon in (5, 10, 20):
+        bt = result["方向回測"][horizon]
+        bt_rows.append({
+            "週期": f"{horizon} 日",
+            "回測訊號數": bt["回測訊號數"],
+            "方向命中率": f"{bt['方向命中率(%)']:.1f}%" if np.isfinite(as_float(bt["方向命中率(%)"])) else "資料不足",
+            "上漲判斷精確率": f"{bt['上漲判斷精確率(%)']:.1f}%" if np.isfinite(as_float(bt["上漲判斷精確率(%)"])) else "無上漲預測／資料不足",
+        })
+    st.dataframe(pd.DataFrame(bt_rows), hide_index=True, use_container_width=True)
+    st.caption("回測採逐日向前方式，歷史訊號只使用當時已知資料；此為簡化技術分類測試，未計入交易成本、滑價、漲跌停與除權息影響，且未經獨立樣本驗證。")
 
     main_rows = [
         ("KD", f"{result['KD']}（K {result['K值']:.1f}／D {result['D值']:.1f}）"),
